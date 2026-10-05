@@ -12,6 +12,7 @@ from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 
 from app import catalog
+from app.observability import log_event
 from app.schemas import Intent
 from app.tools import LAST_LIST_KEY, LAST_PLAN_KEY, get_profile
 
@@ -111,7 +112,15 @@ def order_budget_guard(
         2,
     )
     if total > limit:
-        logger.warning("Order blocked by budget guard: total=%s limit=%s", total, limit)
+        log_event(
+            "guardrail_block",
+            level=logging.WARNING,
+            guard="order_budget_guard",
+            tool=tool.name,
+            call_id=getattr(tool_context, "function_call_id", None),
+            total=total,
+            limit=limit,
+        )
         return {
             "status": "error",
             "error_message": (

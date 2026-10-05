@@ -154,16 +154,41 @@ flowchart TD
 ### 4. Observability & tracing
 - **Cloud Trace** via OpenTelemetry (`otel_to_cloud` in the scaffolded FastAPI app). Spans:
   `invoke_workflow → invoke_agent → call_llm / execute_tool`.
+- **Intent logged *before* execution** — each action can be traced from decision to outcome:
+
+  | Event | Emitted by | When | Key fields |
+  |---|---|---|---|
+  | `route_decision` | `route_intent` | Before the chosen branch runs | `classified_route`, `route`, `next_node`, `request_summary`, `profile_merged` |
+  | `model_route` | planner `before_model_callback` | Before each planner LLM call | `tier`, `model`, `reason` |
+  | `tool_intent` | `ToolAuditPlugin.before_tool_callback` | Before any tool or guard runs | `call_id`, `tool`, `agent`, `purpose`, redacted `args` |
+  | `tool_result` | `ToolAuditPlugin.after_tool/on_tool_error` | After the tool | same `call_id`, `status`, `latency_ms`, `error_message` |
+  | `plan_revision_requested` | `validate_plan` | Before looping back to the planner | `revision`, `violations` |
+  | `guardrail_block` | `order_budget_guard` | When an order is blocked | `total`, `limit`, `call_id` |
+
+- **Active PII scrubbing pipeline** ([`app/redaction.py`](app/redaction.py)) applied to *every* sink:
+  - **Detection**: e-mails, phone numbers, payment cards (Luhn-checked so prices and IDs
+    survive), SSNs, IPs, street addresses and self-introduced names → `[EMAIL]`, `[PHONE]`, ...
+  - **Sensitive keys** (`address`, `email`, `phone`, `name`, `card_number`, ...) are masked whole.
+  - **Logs**: `log_event()` ([`app/observability.py`](app/observability.py)) redacts structured
+    fields, and a process-wide `LogRecord` factory scrubs every other log line, including
+    third-party ones.
+  - **Traces**: custom attributes go through `set_span_attr()`, and spans carry *redacted*
+    previews of the prompt (`pantrypal.llm.input`), reply (`pantrypal.llm.output`), tool args
+    (`pantrypal.tool.args`) and results (`pantrypal.tool.result`). A `RedactingSpanProcessor`
+    also scrubs ADK's own content attributes (`gcp.vertex.agent.llm_request`, ...) before any
+    exporter sees the span. In the cloud, raw ADK content capture stays off as well
+    (defence in depth).
+  - **BigQuery Agent Analytics**: `bq_content_formatter` is the plugin's `content_formatter`, so
+    user messages, LLM requests/responses and tool payloads are redacted before each row is
+    written. If redaction fails the plugin writes `[FORMATTER_FAILED]`, never raw content.
+  - Unit-tested for both catching PII and *not* over-redacting domain data
+    ([`tests/unit/test_redaction.py`](tests/unit/test_redaction.py)).
 - **Custom span attributes**: `pantrypal.route`, `pantrypal.plan_revisions`,
   `pantrypal.plan_violations`, `pantrypal.plan_valid`, `pantrypal.shopping_items`,
-  `pantrypal.tool.status`, `pantrypal.tool.latency_ms`.
-- **`ToolAuditPlugin`** ([`app/plugins.py`](app/plugins.py)): runner-wide structured JSON logs
-  for every tool call (tool, agent, status, latency, argument *keys only*, so no user content)
-  plus invocation summaries. These land in Cloud Logging as `jsonPayload`.
+  `pantrypal.tool.status`, `pantrypal.tool.latency_ms`, `pantrypal.model_tier`, `pantrypal.model`.
 - **BigQuery Agent Analytics plugin**: agent events (LLM calls, tool use) are streamed to
   BigQuery for dashboards and analysis.
-- **Prompt-response logging** to GCS + BigQuery (Terraform-provisioned). Message content is
-  kept **out of spans** (`NO_CONTENT`).
+- **Prompt-response logging** to GCS + BigQuery (Terraform-provisioned).
 
 ```sql
 -- Example: event mix per agent (TOOL_ERROR vs TOOL_COMPLETED, LLM_REQUEST, ...)

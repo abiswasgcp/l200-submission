@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from google.adk.agents.context import Context
 from google.adk.events.event import Event
 from google.genai import types
-from opentelemetry import trace
 
 from app import catalog
+from app.observability import log_event, set_span_attr
 from app.tools import (
     LAST_LIST_KEY,
     LAST_PLAN_KEY,
@@ -19,10 +18,16 @@ from app.tools import (
     get_profile,
 )
 
-logger = logging.getLogger(__name__)
-
 MAX_PLAN_REVISIONS = 2
 VALID_ROUTES = ("profile_or_pantry", "meal_plan", "order", "help", "unrelated")
+# Route -> node that runs next (mirrors the Workflow edges; used in intent logs).
+ROUTE_TARGETS = {
+    "profile_or_pantry": "profile_agent",
+    "meal_plan": "meal_planner",
+    "order": "checkout_agent",
+    "help": "help_node",
+    "unrelated": "decline",
+}
 
 HELP_MESSAGE = (
     "Hi, I'm **PantryPal** 🥕, your meal-plan and grocery concierge. I can:\n"
@@ -43,8 +48,8 @@ DECLINE_MESSAGE = (
 
 
 def _span_attr(key: str, value: Any) -> None:
-    """Adds a custom attribute to the current OpenTelemetry span (Cloud Trace)."""
-    trace.get_current_span().set_attribute(f"pantrypal.{key}", value)
+    """Adds a custom (redacted) attribute to the current span (Cloud Trace)."""
+    set_span_attr(key, value)
 
 
 def _say(text: str):
@@ -66,10 +71,10 @@ def route_intent(ctx: Context, node_input: Any = None):
     """
     intent = node_input if isinstance(node_input, dict) else {}
     route = intent.get("route")
+    classified = route
     if route not in VALID_ROUTES:
         route = "unrelated"
     _span_attr("route", route)
-    logger.info("route_intent route=%s", route)
     state: dict[str, Any] = {}
 
     # Safety net: allergies/diet stated in ANY message (e.g. "I'm allergic to
@@ -102,6 +107,22 @@ def route_intent(ctx: Context, node_input: Any = None):
             "plan_revisions": 0,
             "plan_feedback": "",
         }
+
+    # Pre-execution intent: what was understood and which branch will run,
+    # logged before that branch starts (values pass the PII scrubber).
+    log_event(
+        "route_decision",
+        session_id=ctx.session.id,
+        classified_route=classified,
+        route=route,
+        next_node=ROUTE_TARGETS[route],
+        request_summary=intent.get("request_summary", ""),
+        days=intent.get("days"),
+        max_prep_minutes=intent.get("max_prep_minutes"),
+        profile_merged={"allergies_added": mentioned, "diet": diet}
+        if PROFILE_KEY in state
+        else None,
+    )
     # Forward the user's original message so downstream agents answer it.
     yield Event(output=ctx.user_content, route=route, state=state)
 
@@ -169,7 +190,13 @@ def validate_plan(ctx: Context, node_input: Any = None):
             "Fix these problems and return the full corrected plan:\n- "
             + "\n- ".join(violations)
         )
-        logger.info("validate_plan revise #%d: %s", revisions + 1, violations)
+        log_event(
+            "plan_revision_requested",
+            session_id=ctx.session.id,
+            revision=revisions + 1,
+            next_node="meal_planner",
+            violations=violations,
+        )
         yield Event(
             output=feedback,
             route="revise",

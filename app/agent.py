@@ -53,7 +53,16 @@ from app.models import (
     model_for,
 )
 from app.plugins import ToolAuditPlugin
+from app.redaction import (
+    bq_content_formatter,
+    install_log_redaction,
+    install_trace_redaction,
+)
 from app.schemas import Intent, MealPlan
+
+# PII scrubbing for every log record and span in the process (app/redaction.py).
+install_log_redaction()
+install_trace_redaction()
 
 # Model routing (see app/models.py): lite model for classification/formatting,
 # standard model for tool-using agents, Pro for planner retries.
@@ -271,6 +280,9 @@ if _project_id and os.environ.get("BQ_ANALYTICS_ENABLED", "true").lower() == "tr
                 config=BigQueryLoggerConfig(
                     gcs_bucket_name=os.environ.get("BQ_ANALYTICS_GCS_BUCKET"),
                     connection_id=os.environ.get("BQ_ANALYTICS_CONNECTION_ID"),
+                    # PII scrubbing for every row (user messages, LLM
+                    # requests/responses, tool args/results). Fails closed.
+                    content_formatter=bq_content_formatter,
                 ),
             )
         )

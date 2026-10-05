@@ -17,7 +17,6 @@ Every tier can be overridden with an env var (``MODEL_FAST``, ``MODEL_STANDARD``
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from typing import Literal
@@ -27,9 +26,8 @@ from google.adk.models import Gemini
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
-from opentelemetry import trace
 
-logger = logging.getLogger("pantrypal.routing")
+from app.observability import log_event, set_span_attr
 
 Tier = Literal["fast", "standard", "deep"]
 
@@ -60,20 +58,9 @@ def model_for(role: str) -> Gemini:
 
 
 def _record(agent: str, tier: Tier, reason: str) -> None:
-    span = trace.get_current_span()
-    span.set_attribute("pantrypal.model_tier", tier)
-    span.set_attribute("pantrypal.model", MODELS[tier])
-    logger.info(
-        json.dumps(
-            {
-                "event": "model_route",
-                "agent": agent,
-                "tier": tier,
-                "model": MODELS[tier],
-                "reason": reason,
-            }
-        )
-    )
+    set_span_attr("model_tier", tier)
+    set_span_attr("model", MODELS[tier])
+    log_event("model_route", agent=agent, tier=tier, model=MODELS[tier], reason=reason)
 
 
 # ---------------------------------------------------------------------------
@@ -98,18 +85,15 @@ async def fallback_from_deep_model(
     """on_model_error_callback: if the deep model fails, retry once on standard."""
     if llm_request.model != MODELS["deep"]:
         return None  # not an escalated call; let ADK handle the error
-    logger.warning(
-        json.dumps(
-            {
-                "event": "model_fallback",
-                "agent": callback_context.agent_name,
-                "from": MODELS["deep"],
-                "to": MODELS["standard"],
-                "error": f"{type(error).__name__}: {error}"[:300],
-            }
-        )
+    log_event(
+        "model_fallback",
+        level=logging.WARNING,
+        agent=callback_context.agent_name,
+        from_model=MODELS["deep"],
+        to_model=MODELS["standard"],
+        error=f"{type(error).__name__}: {error}"[:300],
     )
-    trace.get_current_span().set_attribute("pantrypal.model_fallback", True)
+    set_span_attr("model_fallback", True)
     llm_request.model = MODELS["standard"]
     final: LlmResponse | None = None
     async for response in gemini("standard").generate_content_async(llm_request):
