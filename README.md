@@ -51,7 +51,7 @@ flowchart TD
     PLAN --> VAL{"validate_plan<br/>allergens · diet · budget · prep"}
     VAL -- "revise (max 2)" --> PLAN
     VAL -- ok --> SHOP["build_shopping_list<br/>plan minus pantry, priced"]
-    SHOP --> PRES["presenter<br/>Markdown plan + list"]
+    SHOP --> PRESENT["presenter<br/>Markdown plan + list"]
     R -- order --> CHK["checkout_agent<br/>place_grocery_order (require_confirmation)"]
     CHK -. "approve / reject" .-> U
     R -- help --> HELP["help_node"]
@@ -65,7 +65,7 @@ flowchart TD
     PLAN <--> ST
     VAL <--> ST
     PROF -- add_session_to_memory --> MB
-    PRES -- add_session_to_memory --> MB
+    PRESENT -- add_session_to_memory --> MB
     MB -- preload_memory --> PLAN
     MB -- preload_memory --> PROF
 ```
@@ -127,6 +127,25 @@ flowchart TD
   sends precise feedback back to the planner up to twice. After that, unsafe meals are
   **removed**, so an allergen can never reach the user.
 - **Typed hand-offs** (`output_schema=MealPlan`) between LLM and code nodes.
+- **Strategic model routing** ([`app/models.py`](app/models.py)): each node gets the
+  cheapest model that can do its job, and the planner escalates when it struggles.
+
+  | Node | Tier | Default model | Why |
+  |---|---|---|---|
+  | `intake_classifier` | fast | `gemini-3.5-flash-lite` | 5-way structured classification |
+  | `presenter` | fast | `gemini-3.5-flash-lite` | Formats data code already computed |
+  | Compaction summarizer | fast | `gemini-3.5-flash-lite` | Summarises old events |
+  | `profile_agent`, `checkout_agent` | standard | `gemini-3.8-flash` | Tool calling |
+  | `meal_planner` (1st attempt) | standard | `gemini-3.8-flash` | Tool calling + constraints |
+  | `meal_planner` (after validator rejects) | **deep** | `gemini-3.1-pro-preview` | Harder multi-constraint retry |
+
+  - **Dynamic escalation**: a `before_model_callback` (`escalate_planner_model`) switches the
+    planner to the deep model once `plan_revisions >= 1`.
+  - **Fallback**: an `on_model_error_callback` (`fallback_from_deep_model`) re-runs a failed
+    deep-model call on the standard model, so preview-capacity errors don't fail the turn.
+  - Every routing decision is logged (`model_route` / `model_fallback` JSON) and tagged on the
+    span (`pantrypal.model_tier`, `pantrypal.model`, `pantrypal.model_fallback`).
+  - Tiers are overridable via `MODEL_FAST`, `MODEL_STANDARD` and `MODEL_DEEP` env vars.
 - **Resilience**: `HttpRetryOptions` on every model, `ReflectAndRetryToolPlugin`, and
   `after_model_callback` fallbacks for blocked or empty responses (the classifier falls back to
   `unrelated`, and replies fall back to a polite message).

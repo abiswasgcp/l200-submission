@@ -37,7 +37,6 @@ from google.adk.agents import LlmAgent
 from google.adk.apps import App, ResumabilityConfig
 from google.adk.apps.app import EventsCompactionConfig
 from google.adk.apps.llm_event_summarizer import LlmEventSummarizer
-from google.adk.models import Gemini
 from google.adk.plugins import ReflectAndRetryToolPlugin
 from google.adk.plugins.bigquery_agent_analytics_plugin import (
     BigQueryAgentAnalyticsPlugin,
@@ -46,28 +45,25 @@ from google.adk.plugins.bigquery_agent_analytics_plugin import (
 from google.adk.tools import preload_memory
 from google.adk.workflow import Workflow
 from google.cloud import bigquery
-from google.genai import types
 
 from app import callbacks, nodes, tools
+from app.models import (
+    escalate_planner_model,
+    fallback_from_deep_model,
+    model_for,
+)
 from app.plugins import ToolAuditPlugin
 from app.schemas import Intent, MealPlan
 
-MODEL = "gemini-3.8-flash"
-
-
-def _model() -> Gemini:
-    return Gemini(
-        model=MODEL,
-        retry_options=types.HttpRetryOptions(attempts=3),
-    )
-
+# Model routing (see app/models.py): lite model for classification/formatting,
+# standard model for tool-using agents, Pro for planner retries.
 
 # ---------------------------------------------------------------------------
 # 1. Intake classifier (structured output -> deterministic router)
 # ---------------------------------------------------------------------------
 intake_classifier = LlmAgent(
     name="intake_classifier",
-    model=_model(),
+    model=model_for("intake_classifier"),
     description="Classifies each user turn into a PantryPal route.",
     instruction=(
         "You are the intake router for PantryPal, a meal-planning and grocery "
@@ -94,7 +90,7 @@ intake_classifier = LlmAgent(
 # ---------------------------------------------------------------------------
 profile_agent = LlmAgent(
     name="profile_agent",
-    model=_model(),
+    model=model_for("profile_agent"),
     description="Maintains the household dietary profile and pantry.",
     instruction=(
         "You are PantryPal's household assistant. Keep the household's dietary "
@@ -132,7 +128,7 @@ profile_agent = LlmAgent(
 # ---------------------------------------------------------------------------
 meal_planner = LlmAgent(
     name="meal_planner",
-    model=_model(),
+    model=model_for("meal_planner"),
     description="Selects catalog recipes for a meal plan.",
     instruction=(
         "You are PantryPal's meal planner. Choose dinners ONLY from the recipe "
@@ -162,11 +158,15 @@ meal_planner = LlmAgent(
     ],
     output_schema=MealPlan,
     output_key="draft_plan",
+    # Dynamic routing: escalate to the deep model when the validator rejects
+    # a plan; fall back to the standard model if the deep model errors.
+    before_model_callback=escalate_planner_model,
+    on_model_error_callback=fallback_from_deep_model,
 )
 
 presenter = LlmAgent(
     name="presenter",
-    model=_model(),
+    model=model_for("presenter"),
     description="Formats the validated plan and shopping list for the user.",
     instruction=(
         "You are PantryPal. You receive a JSON object with a validated meal "
@@ -195,7 +195,7 @@ presenter = LlmAgent(
 # ---------------------------------------------------------------------------
 checkout_agent = LlmAgent(
     name="checkout_agent",
-    model=_model(),
+    model=model_for("checkout_agent"),
     description="Places the grocery order after explicit user approval.",
     instruction=(
         "You are PantryPal's checkout assistant.\n"
@@ -286,7 +286,7 @@ app = App(
     events_compaction_config=EventsCompactionConfig(
         token_threshold=24000,
         event_retention_size=6,
-        summarizer=LlmEventSummarizer(llm=_model()),
+        summarizer=LlmEventSummarizer(llm=model_for("summarizer")),
     ),
     # Needed for the human-in-the-loop pause/resume around checkout.
     resumability_config=ResumabilityConfig(is_resumable=True),
